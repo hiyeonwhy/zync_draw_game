@@ -1,0 +1,801 @@
+#include <stdio.h>
+#include <string.h>
+#include "xil_printf.h"
+#include "xil_io.h"
+#include "xiicps.h"
+#include "xparameters.h"
+#include "ff.h"
+#include "seven_seg.h"
+#include "textlcd.h"
+#include "xgpio.h"
+#include "xuartps_hw.h"
+
+#define TextLine1   0
+#define TextLine2   1
+#define CR          0x0d
+#define MAX         17
+#define IIC_SLAVE_ADDR   0x51
+#define IIC_SCLK_RATE    100000
+#define GPIO_DONE_DEVICE_ID XPAR_GPIO_0_DEVICE_ID
+#define GPIO_DONE_CHANNEL 1
+
+#define IMAGE_BASEADDR (XPAR_TFTLCD_0_S00_AXI_BASEADDR + 0x4000)
+#define BASEADDR XPAR_TFTLCD_0_S00_AXI_BASEADDR
+#define SHAPE_MODE_REG   (XPAR_TFTLCD_0_S00_AXI_BASEADDR + 4)  // slv_reg1
+
+// SD card / FATFS
+static FATFS fatfs;
+static FIL fil;
+static char filename[32];
+FRESULT Res;
+TCHAR *Path = "0:/";
+u32 *buffer[65280];
+u32 data_size = 4 * 65280;
+u32 NumBytesRead;
+
+// GPIO
+XGpio GpioDone;
+
+// 함수 선언 (실사용만)
+void GetCmd(char *sel);
+void GetCmdWithLiveLCD(char *buf, int line);
+void WriteTLCDByString(char *text, int line);
+void load_image_from_sdcard(const char *filename);
+void FormatTimeLine(char *buf, u8 min, u8 sec);
+void FormatScoreLine(char *buf, int score);
+int  ReadRTC(XIicPs Iic, u8 *SendBuffer, u8 *RecvBuffer);
+int  WriteRTC(XIicPs *Iic, u8 min, u8 sec);
+
+int main()
+{
+    // UART Enable
+
+    NumBytesRead = 0;
+    Res = f_mount(&fatfs, Path, 0);
+
+    int score = 123; // 0123 → 123으로 고침
+    int i, wait;
+
+    // RTC, 7-seg, TextLCD
+    XIicPs Iic;
+    int IicStatus;
+    u8 SendBuffer;
+    u8 RecvBuffer[3];
+
+    char input[16] = {0};
+    char TlcdReg_upline[17] = {0};
+    char TlcdReg_downline[17] = {0};
+
+    char id[MAX] = {0};
+    char pw[MAX] = {0};
+
+    Xil_Out32(XPAR_SEVEN_SEG_0_S00_AXI_BASEADDR, 0);
+    unsigned int CntrlRegister;
+    // UART Enable
+    CntrlRegister = XUartPs_ReadReg(XPAR_PS7_UART_1_BASEADDR, XUARTPS_CR_OFFSET);
+    XUartPs_WriteReg(XPAR_PS7_UART_1_BASEADDR, XUARTPS_CR_OFFSET,
+        ((CntrlRegister & ~XUARTPS_CR_EN_DIS_MASK) | XUARTPS_CR_TX_EN | XUARTPS_CR_RX_EN));
+
+
+
+    while (1)
+    {
+        Xil_Out32(BASEADDR + 0x00, 1);
+        load_image_from_sdcard("gstart.bin");
+        xil_printf("================ LOGIN ================\r\n");
+        xil_printf("Enter your ID: ");
+        GetCmdWithLiveLCD(id, TextLine1);
+        WriteTLCDByString("                ", TextLine2);
+
+        if (strcmp(id, "soc1234") == 0)
+        {
+            xil_printf("Enter your Password: ");
+            GetCmd(pw);
+
+            if (strcmp(pw, "123456789") == 0)
+            {
+                xil_printf("Login Success!\r\n");
+                xil_printf("Select Game Level (Triangle / Square / Circle):\r\n");
+
+                // LCD Line 1: "Welcome soc1234!"
+                char welcome_msg[MAX] = "Welcome ";
+                strncat(welcome_msg, id, MAX - strlen(welcome_msg) - 2);
+                strcat(welcome_msg, "!");
+                WriteTLCDByString(welcome_msg, TextLine1);
+                WriteTLCDByString("                ", TextLine2);
+
+                break;
+            }
+            else xil_printf("Wrong Password.\r\n");
+        }
+        else xil_printf("Wrong ID.\r\n");
+    }
+
+    //  (shape_mode = 3)
+    Xil_Out32(SHAPE_MODE_REG, 0);
+
+    // 도형 입력 받기
+    xil_printf("Shape Coloring Game Started.\r\n");
+   while (1) {
+        xil_printf("\r\n> ");
+        scanf("%s", input);
+
+        if (strcmp(input, "square") == 0) {
+            Xil_Out32(SHAPE_MODE_REG, 0);
+            xil_printf("Shape set to: square\r\n");
+            break;
+        } else if (strcmp(input, "circle") == 0) {
+            Xil_Out32(SHAPE_MODE_REG, 1);
+            xil_printf("Shape set to: circle\r\n");
+            break;
+        } else if (strcmp(input, "grapes") == 0) {
+            Xil_Out32(SHAPE_MODE_REG, 2);
+            xil_printf("Shape set to: grapes\r\n");
+            break;
+        } else {
+            xil_printf("Invalid input. Use: square / circle / grapes\r\n");
+        }
+    }
+    // LCD에 선택된 모드 표시
+    char level_line[MAX + 7] = "Shape: ";
+    strncat(level_line, input, MAX - 7);
+    WriteTLCDByString(level_line, TextLine2);
+
+    xil_printf("Fill the shape completely to clear the game.\r\n");
+
+    // GPIO done 핀 초기화
+    XGpio_Initialize(&GpioDone, GPIO_DONE_DEVICE_ID);
+    XGpio_SetDataDirection(&GpioDone, GPIO_DONE_CHANNEL, 0xFFFFFFFF); // input
+
+    // RTC 초기화
+    WriteRTC(&Iic, 0, 0);
+
+    while(1) {
+        // mode0(Box Mode)로 진입
+        Xil_Out32(BASEADDR + 0x00, 0);
+        // RTC 읽기, 7-segment, TextLCD 출력
+        int IicStatus = ReadRTC(Iic, &SendBuffer, RecvBuffer);
+        if (IicStatus != XST_SUCCESS)
+            return XST_FAILURE;
+
+        u8 min = RecvBuffer[1] & 0x7F;
+        u8 sec = RecvBuffer[0] & 0x7F;
+        int min_dec = ((min >> 4) * 10) + (min & 0x0F);
+        int sec_dec = ((sec >> 4) * 10) + (sec & 0x0F);
+
+        int seg_data =
+            ((min_dec / 10) << 28) | ((min_dec % 10) << 24) |
+            ((sec_dec / 10) << 20) | ((sec_dec % 10) << 16) |
+            ((score / 1000 % 10) << 12) | ((score / 100 % 10) << 8) |
+            ((score / 10 % 10) << 4) | (score % 10);
+
+        SEVEN_SEG_mWriteReg(XPAR_SEVEN_SEG_0_S00_AXI_BASEADDR, 0, seg_data);
+
+        FormatTimeLine(TlcdReg_upline, min_dec, sec_dec);
+        FormatScoreLine(TlcdReg_downline, score);
+
+        for(i = 0; i < 4; i++) {
+            u32 up_word = (TlcdReg_upline[i*4]     << 24) |
+                          (TlcdReg_upline[i*4 + 1] << 16) |
+                          (TlcdReg_upline[i*4 + 2] << 8)  |
+                          (TlcdReg_upline[i*4 + 3]);
+
+            u32 down_word = (TlcdReg_downline[i*4]     << 24) |
+                            (TlcdReg_downline[i*4 + 1] << 16) |
+                            (TlcdReg_downline[i*4 + 2] << 8)  |
+                            (TlcdReg_downline[i*4 + 3]);
+
+            TEXTLCD_mWriteReg(XPAR_TEXTLCD_0_S00_AXI_BASEADDR, i * 4, up_word);
+            TEXTLCD_mWriteReg(XPAR_TEXTLCD_0_S00_AXI_BASEADDR, i * 4 + 16, down_word);
+        }
+
+        // Box Mode: done 신호 체크
+        int done_signal = XGpio_DiscreteRead(&GpioDone, GPIO_DONE_CHANNEL);
+        if (done_signal == 1) {
+            xil_printf("Game Clear Detected!\r\n");
+
+            // LCD 메시지
+            WriteTLCDByString("Game Clear!", TextLine1);
+            WriteTLCDByString("            ", TextLine2);
+
+            // 7-seg 초기화
+            SEVEN_SEG_mWriteReg(XPAR_SEVEN_SEG_0_S00_AXI_BASEADDR, 0, 0);
+
+            // TFT LCD: game clear 이미지
+            load_image_from_sdcard("gclear.bin");
+            Xil_Out32(BASEADDR + 0x00, 1);
+
+
+            break;
+        }
+
+
+        // 간단한 딜레이 (필요시)
+        for(wait = 0; wait < 120000; wait++);
+    }
+
+    return 0;
+}
+
+void load_image_from_sdcard(const char *filename) {
+
+
+    Res = f_mount(&fatfs, Path, 0);
+    if (Res != FR_OK) {
+        xil_printf("Mount fail\n");
+        return;
+    }
+
+    Res = f_open(&fil, filename, FA_READ);
+    if (Res) {
+        xil_printf("File open fail: %s\n", filename);
+        return;
+    }
+
+    Res = f_lseek(&fil, 0);
+    if (Res) {
+        xil_printf("File seek fail\n");
+        f_close(&fil);
+        return;
+    }
+
+    Res = f_read(&fil, buffer, data_size, &NumBytesRead);
+    if (Res || NumBytesRead != data_size) {
+        xil_printf("Read fail\n");
+        f_close(&fil);
+        return;
+    }
+
+    f_close(&fil);
+
+    // 이미지 데이터를 TFT LCD로 출력
+    int Data, R, G, B;
+    int pixel_offset = 110;
+    int y_offset = -8;
+
+    for (int i = 0; i < 272; i++) {
+        int y_index = i + y_offset;
+        if (y_index < 0 || y_index >= 272) continue;
+
+        int src_i = 271 - i;
+
+        for (int j = 0; j < 240; j++) {
+            Data = (int)buffer[j + 240 * src_i] & 0x0000ffff;
+            R = (Data >> 11) & 0x0000001f;
+            G = Data & 0x000007E0;
+            B = Data & 0x0000001f;
+            Data = (B << 11) | G | R;
+            Xil_Out32(IMAGE_BASEADDR + (2 * (j + pixel_offset) + 480 * y_index) * 4, Data);
+
+            Data = (int)buffer[j + 240 * src_i] >> 16;
+            R = (Data >> 11) & 0x0000001f;
+            G = Data & 0x000007E0;
+            B = Data & 0x0000001f;
+            Data = (B << 11) | G | R;
+            Xil_Out32(IMAGE_BASEADDR + (2 * (j + pixel_offset) + 1 + 480 * y_index) * 4, Data);
+        }
+    }
+
+
+}
+
+
+void FormatTimeLine(char *buf, u8 min, u8 sec)
+{
+    // "Time  12:34     " = 16
+    sprintf(buf, "Time  %02d:%02d     ", min, sec);
+    buf[16] = '\0';
+}
+
+void FormatScoreLine(char *buf, int score)
+{
+    // "Score 0056      " = 16
+    sprintf(buf, "Score %04d       ", score);
+    buf[16] = '\0';
+}
+
+int ReadRTC(XIicPs Iic, u8 *SendBuffer, u8 *RecvBuffer)
+{
+	int				Status;
+	XIicPs_Config	*Config;
+
+	Config = XIicPs_LookupConfig(XPAR_XIICPS_0_DEVICE_ID);
+	if (Config == NULL)
+		return XST_FAILURE;
+
+	Status = XIicPs_CfgInitialize(&Iic, Config, Config->BaseAddress);
+	if (Status != XST_SUCCESS)
+		return XST_FAILURE;
+
+	XIicPs_SetSClk(&Iic, IIC_SCLK_RATE);
+
+	*SendBuffer = 0x02;
+	RecvBuffer[0] = 0;
+	RecvBuffer[1] = 0;
+	RecvBuffer[2] = 0;
+
+	Status = XIicPs_MasterSendPolled(&Iic, SendBuffer, 1, IIC_SLAVE_ADDR);
+	if(Status != XST_SUCCESS)
+		return XST_FAILURE;
+
+	while(XIicPs_BusIsBusy(&Iic)) {}
+
+	Status = XIicPs_MasterRecvPolled(&Iic, RecvBuffer, 3, IIC_SLAVE_ADDR);
+	if (Status != XST_SUCCESS)
+		return XST_FAILURE;
+
+	return XST_SUCCESS;
+}
+
+int WriteRTC(XIicPs *Iic, u8 min, u8 sec)
+{
+    int Status;
+    XIicPs_Config *Config;
+    u8 SetBuffer[3];
+
+    Config = XIicPs_LookupConfig(XPAR_XIICPS_0_DEVICE_ID);
+    if (Config == NULL)
+        return XST_FAILURE;
+
+    Status = XIicPs_CfgInitialize(Iic, Config, Config->BaseAddress);
+    if (Status != XST_SUCCESS)
+        return XST_FAILURE;
+
+    XIicPs_SetSClk(Iic, IIC_SCLK_RATE);
+
+    // RTC 시작 주소: 0x02
+    SetBuffer[0] = 0x02;
+
+    // BCD로 시간값 설정
+    SetBuffer[1] = ((sec / 10) << 4) | (sec % 10);       // 초
+    SetBuffer[1] &= 0x7F;  // CH 비트 클리어
+    SetBuffer[2] = ((min / 10) << 4) | (min % 10);       // 분
+
+    // 주소 + 2바이트 시간값 전송
+    Status = XIicPs_MasterSendPolled(Iic, SetBuffer, 3, IIC_SLAVE_ADDR);
+    if (Status != XST_SUCCESS)
+        return XST_FAILURE;
+
+    while (XIicPs_BusIsBusy(Iic)) {}
+
+    return XST_SUCCESS;
+}
+
+
+// UART 문자열 입력
+void GetCmd(char *sel)
+{
+    int i = 0;
+    char ch;
+    do {
+        ch = XUartPs_RecvByte(XPAR_PS7_UART_1_BASEADDR);
+        if (ch == CR) break;
+        if (i < MAX - 1) {
+            sel[i++] = ch;
+            XUartPs_SendByte(XPAR_PS7_UART_1_BASEADDR, ch);
+        }
+    } while (1);
+    sel[i] = '\0';
+}
+
+void GetCmdWithLiveLCD(char *buf, int line)
+{
+    int i = 0;
+    char ch;
+
+    do {
+        ch = XUartPs_RecvByte(XPAR_PS7_UART_1_BASEADDR);
+        if (ch == CR) break;
+
+        if (i < MAX - 1) {
+            buf[i++] = ch;
+            buf[i] = '\0';  // null terminate
+            XUartPs_SendByte(XPAR_PS7_UART_1_BASEADDR, ch);
+            WriteTLCDByString(buf, line);  // 실시간 LCD 출력
+        }
+    } while (1);
+
+    buf[i] = '\0';
+}
+
+// 문자열을 레지스터에 맞게 TextLCD로 출력
+void WriteTLCDByString(char *text, int line)
+{
+    unsigned int RegVal[4] = {0};
+    int nReg, nOffset;
+    char padded[17] = {0};  // 16자 + NULL
+
+    // 1. 문자열을 16자까지 공백으로 패딩
+    int len = strlen(text);
+    if (len > 16) len = 16;
+    strncpy(padded, text, len);
+    for (int i = len; i < 16; i++) {
+        padded[i] = ' ';
+    }
+
+    // 2. 4바이트 단위로 레지스터 값 계산
+    for (nReg = 0; nReg < 4; nReg++)
+    {
+        for (nOffset = 0; nOffset < 4; nOffset++)
+        {
+            int idx = nReg * 4 + nOffset;
+            RegVal[nReg] |= ((unsigned int)padded[idx] << (8 * (3 - nOffset)));
+        }
+    }
+
+    // 3. 레지스터 쓰기
+    int base = (line == TextLine1) ? 0 : 4;
+    for (nReg = 0; nReg < 4; nReg++)
+    {
+        TEXTLCD_mWriteReg(XPAR_TEXTLCD_0_S00_AXI_BASEADDR,
+                          TEXTLCD_S00_AXI_SLV_REG0_OFFSET + 4 * (base + nReg),
+                          RegVal[nReg]);
+    }
+}
+
+    char id[MAX] = {0};
+    char pw[MAX] = {0};
+
+    Xil_Out32(XPAR_SEVEN_SEG_0_S00_AXI_BASEADDR, 0);
+    unsigned int CntrlRegister;
+    // UART Enable
+    CntrlRegister = XUartPs_ReadReg(XPAR_PS7_UART_1_BASEADDR, XUARTPS_CR_OFFSET);
+    XUartPs_WriteReg(XPAR_PS7_UART_1_BASEADDR, XUARTPS_CR_OFFSET,
+        ((CntrlRegister & ~XUARTPS_CR_EN_DIS_MASK) | XUARTPS_CR_TX_EN | XUARTPS_CR_RX_EN));
+
+
+
+    while (1)
+    {
+        Xil_Out32(BASEADDR + 0x00, 1);
+        load_image_from_sdcard("gstart.bin");
+        xil_printf("================ LOGIN ================\r\n");
+        xil_printf("Enter your ID: ");
+        GetCmdWithLiveLCD(id, TextLine1);
+        WriteTLCDByString("                ", TextLine2);
+
+        if (strcmp(id, "soc1234") == 0)
+        {
+            xil_printf("Enter your Password: ");
+            GetCmd(pw);
+
+            if (strcmp(pw, "123456789") == 0)
+            {
+                xil_printf("Login Success!\r\n");
+                xil_printf("Select Game Level (Triangle / Square / Circle):\r\n");
+
+                // LCD Line 1: "Welcome soc1234!"
+                char welcome_msg[MAX] = "Welcome ";
+                strncat(welcome_msg, id, MAX - strlen(welcome_msg) - 2);
+                strcat(welcome_msg, "!");
+                WriteTLCDByString(welcome_msg, TextLine1);
+                WriteTLCDByString("                ", TextLine2);
+
+                break;
+            }
+            else xil_printf("Wrong Password.\r\n");
+        }
+        else xil_printf("Wrong ID.\r\n");
+    }
+
+    //  (shape_mode = 3)
+    Xil_Out32(SHAPE_MODE_REG, 3);
+
+    // 도형 입력 받기
+    xil_printf("Shape Coloring Game Started.\r\n");
+   while (1) {
+        xil_printf("\r\n> ");
+        scanf("%s", input);
+
+        if (strcmp(input, "square") == 0) {
+            Xil_Out32(SHAPE_MODE_REG, 0);
+            xil_printf("Shape set to: square\r\n");
+            break;
+        } else if (strcmp(input, "circle") == 0) {
+            Xil_Out32(SHAPE_MODE_REG, 1);
+            xil_printf("Shape set to: circle\r\n");
+            break;
+        } else if (strcmp(input, "grapes") == 0) {
+            Xil_Out32(SHAPE_MODE_REG, 2);
+            xil_printf("Shape set to: grapes\r\n");
+            break;
+        } else {
+            xil_printf("Invalid input. Use: square / circle / grapes\r\n");
+        }
+    }
+    // LCD에 선택된 모드 표시
+    char level_line[MAX + 7] = "Shape: ";
+    strncat(level_line, input, MAX - 7);
+    WriteTLCDByString(level_line, TextLine2);
+
+    xil_printf("Fill the shape completely to clear the game.\r\n");
+
+    // GPIO done 핀 초기화
+    XGpio_Initialize(&GpioDone, GPIO_DONE_DEVICE_ID);
+    XGpio_SetDataDirection(&GpioDone, GPIO_DONE_CHANNEL, 0xFFFFFFFF); // input
+
+    // RTC 초기화
+    WriteRTC(&Iic, 0, 0);
+
+    while(1) {
+        // mode0(Box Mode)로 진입
+        Xil_Out32(BASEADDR + 0x00, 0);
+        // RTC 읽기, 7-segment, TextLCD 출력
+        int IicStatus = ReadRTC(Iic, &SendBuffer, RecvBuffer);
+        if (IicStatus != XST_SUCCESS)
+            return XST_FAILURE;
+
+        u8 min = RecvBuffer[1] & 0x7F;
+        u8 sec = RecvBuffer[0] & 0x7F;
+        int min_dec = ((min >> 4) * 10) + (min & 0x0F);
+        int sec_dec = ((sec >> 4) * 10) + (sec & 0x0F);
+
+        int seg_data =
+            ((min_dec / 10) << 28) | ((min_dec % 10) << 24) |
+            ((sec_dec / 10) << 20) | ((sec_dec % 10) << 16) |
+            ((score / 1000 % 10) << 12) | ((score / 100 % 10) << 8) |
+            ((score / 10 % 10) << 4) | (score % 10);
+
+        SEVEN_SEG_mWriteReg(XPAR_SEVEN_SEG_0_S00_AXI_BASEADDR, 0, seg_data);
+
+        FormatTimeLine(TlcdReg_upline, min_dec, sec_dec);
+        FormatScoreLine(TlcdReg_downline, score);
+
+        for(i = 0; i < 4; i++) {
+            u32 up_word = (TlcdReg_upline[i*4]     << 24) |
+                          (TlcdReg_upline[i*4 + 1] << 16) |
+                          (TlcdReg_upline[i*4 + 2] << 8)  |
+                          (TlcdReg_upline[i*4 + 3]);
+
+            u32 down_word = (TlcdReg_downline[i*4]     << 24) |
+                            (TlcdReg_downline[i*4 + 1] << 16) |
+                            (TlcdReg_downline[i*4 + 2] << 8)  |
+                            (TlcdReg_downline[i*4 + 3]);
+
+            TEXTLCD_mWriteReg(XPAR_TEXTLCD_0_S00_AXI_BASEADDR, i * 4, up_word);
+            TEXTLCD_mWriteReg(XPAR_TEXTLCD_0_S00_AXI_BASEADDR, i * 4 + 16, down_word);
+        }
+
+        // Box Mode: done 신호 체크
+        int done_signal = XGpio_DiscreteRead(&GpioDone, GPIO_DONE_CHANNEL);
+        if (done_signal == 1) {
+            xil_printf("Game Clear Detected!\r\n");
+
+            // LCD 메시지
+            WriteTLCDByString("Game Clear!", TextLine1);
+            WriteTLCDByString("            ", TextLine2);
+
+            // 7-seg 초기화
+            SEVEN_SEG_mWriteReg(XPAR_SEVEN_SEG_0_S00_AXI_BASEADDR, 0, 0);
+
+            // TFT LCD: game clear 이미지
+            load_image_from_sdcard("gclear.bin");
+            Xil_Out32(BASEADDR + 0x00, 1);
+
+
+            break;
+        }
+
+
+        // 간단한 딜레이 (필요시)
+        for(wait = 0; wait < 120000; wait++);
+    }
+
+    return 0;
+}
+
+void load_image_from_sdcard(const char *filename) {
+
+
+    Res = f_mount(&fatfs, Path, 0);
+    if (Res != FR_OK) {
+        xil_printf("Mount fail\n");
+        return;
+    }
+
+    Res = f_open(&fil, filename, FA_READ);
+    if (Res) {
+        xil_printf("File open fail: %s\n", filename);
+        return;
+    }
+
+    Res = f_lseek(&fil, 0);
+    if (Res) {
+        xil_printf("File seek fail\n");
+        f_close(&fil);
+        return;
+    }
+
+    Res = f_read(&fil, buffer, data_size, &NumBytesRead);
+    if (Res || NumBytesRead != data_size) {
+        xil_printf("Read fail\n");
+        f_close(&fil);
+        return;
+    }
+
+    f_close(&fil);
+
+    // 이미지 데이터를 TFT LCD로 출력
+    int Data, R, G, B;
+    int pixel_offset = 110;
+    int y_offset = -8;
+
+    for (int i = 0; i < 272; i++) {
+        int y_index = i + y_offset;
+        if (y_index < 0 || y_index >= 272) continue;
+
+        int src_i = 271 - i;
+
+        for (int j = 0; j < 240; j++) {
+            Data = (int)buffer[j + 240 * src_i] & 0x0000ffff;
+            R = (Data >> 11) & 0x0000001f;
+            G = Data & 0x000007E0;
+            B = Data & 0x0000001f;
+            Data = (B << 11) | G | R;
+            Xil_Out32(IMAGE_BASEADDR + (2 * (j + pixel_offset) + 480 * y_index) * 4, Data);
+
+            Data = (int)buffer[j + 240 * src_i] >> 16;
+            R = (Data >> 11) & 0x0000001f;
+            G = Data & 0x000007E0;
+            B = Data & 0x0000001f;
+            Data = (B << 11) | G | R;
+            Xil_Out32(IMAGE_BASEADDR + (2 * (j + pixel_offset) + 1 + 480 * y_index) * 4, Data);
+        }
+    }
+
+
+}
+
+
+void FormatTimeLine(char *buf, u8 min, u8 sec)
+{
+    // "Time  12:34     " = 16
+    sprintf(buf, "Time  %02d:%02d     ", min, sec);
+    buf[16] = '\0';
+}
+
+void FormatScoreLine(char *buf, int score)
+{
+    // "Score 0056      " = 16
+    sprintf(buf, "Score %04d       ", score);
+    buf[16] = '\0';
+}
+
+int ReadRTC(XIicPs Iic, u8 *SendBuffer, u8 *RecvBuffer)
+{
+	int				Status;
+	XIicPs_Config	*Config;
+
+	Config = XIicPs_LookupConfig(XPAR_XIICPS_0_DEVICE_ID);
+	if (Config == NULL)
+		return XST_FAILURE;
+
+	Status = XIicPs_CfgInitialize(&Iic, Config, Config->BaseAddress);
+	if (Status != XST_SUCCESS)
+		return XST_FAILURE;
+
+	XIicPs_SetSClk(&Iic, IIC_SCLK_RATE);
+
+	*SendBuffer = 0x02;
+	RecvBuffer[0] = 0;
+	RecvBuffer[1] = 0;
+	RecvBuffer[2] = 0;
+
+	Status = XIicPs_MasterSendPolled(&Iic, SendBuffer, 1, IIC_SLAVE_ADDR);
+	if(Status != XST_SUCCESS)
+		return XST_FAILURE;
+
+	while(XIicPs_BusIsBusy(&Iic)) {}
+
+	Status = XIicPs_MasterRecvPolled(&Iic, RecvBuffer, 3, IIC_SLAVE_ADDR);
+	if (Status != XST_SUCCESS)
+		return XST_FAILURE;
+
+	return XST_SUCCESS;
+}
+
+int WriteRTC(XIicPs *Iic, u8 min, u8 sec)
+{
+    int Status;
+    XIicPs_Config *Config;
+    u8 SetBuffer[3];
+
+    Config = XIicPs_LookupConfig(XPAR_XIICPS_0_DEVICE_ID);
+    if (Config == NULL)
+        return XST_FAILURE;
+
+    Status = XIicPs_CfgInitialize(Iic, Config, Config->BaseAddress);
+    if (Status != XST_SUCCESS)
+        return XST_FAILURE;
+
+    XIicPs_SetSClk(Iic, IIC_SCLK_RATE);
+
+    // RTC 시작 주소: 0x02
+    SetBuffer[0] = 0x02;
+
+    // BCD로 시간값 설정
+    SetBuffer[1] = ((sec / 10) << 4) | (sec % 10);       // 초
+    SetBuffer[1] &= 0x7F;  // CH 비트 클리어
+    SetBuffer[2] = ((min / 10) << 4) | (min % 10);       // 분
+
+    // 주소 + 2바이트 시간값 전송
+    Status = XIicPs_MasterSendPolled(Iic, SetBuffer, 3, IIC_SLAVE_ADDR);
+    if (Status != XST_SUCCESS)
+        return XST_FAILURE;
+
+    while (XIicPs_BusIsBusy(Iic)) {}
+
+    return XST_SUCCESS;
+}
+
+
+// UART 문자열 입력
+void GetCmd(char *sel)
+{
+    int i = 0;
+    char ch;
+    do {
+        ch = XUartPs_RecvByte(XPAR_PS7_UART_1_BASEADDR);
+        if (ch == CR) break;
+        if (i < MAX - 1) {
+            sel[i++] = ch;
+            XUartPs_SendByte(XPAR_PS7_UART_1_BASEADDR, ch);
+        }
+    } while (1);
+    sel[i] = '\0';
+}
+
+void GetCmdWithLiveLCD(char *buf, int line)
+{
+    int i = 0;
+    char ch;
+
+    do {
+        ch = XUartPs_RecvByte(XPAR_PS7_UART_1_BASEADDR);
+        if (ch == CR) break;
+
+        if (i < MAX - 1) {
+            buf[i++] = ch;
+            buf[i] = '\0';  // null terminate
+            XUartPs_SendByte(XPAR_PS7_UART_1_BASEADDR, ch);
+            WriteTLCDByString(buf, line);  // 실시간 LCD 출력
+        }
+    } while (1);
+
+    buf[i] = '\0';
+}
+
+// 문자열을 레지스터에 맞게 TextLCD로 출력
+void WriteTLCDByString(char *text, int line)
+{
+    unsigned int RegVal[4] = {0};
+    int nReg, nOffset;
+    char padded[17] = {0};  // 16자 + NULL
+
+    // 1. 문자열을 16자까지 공백으로 패딩
+    int len = strlen(text);
+    if (len > 16) len = 16;
+    strncpy(padded, text, len);
+    for (int i = len; i < 16; i++) {
+        padded[i] = ' ';
+    }
+
+    // 2. 4바이트 단위로 레지스터 값 계산
+    for (nReg = 0; nReg < 4; nReg++)
+    {
+        for (nOffset = 0; nOffset < 4; nOffset++)
+        {
+            int idx = nReg * 4 + nOffset;
+            RegVal[nReg] |= ((unsigned int)padded[idx] << (8 * (3 - nOffset)));
+        }
+    }
+
+    // 3. 레지스터 쓰기
+    int base = (line == TextLine1) ? 0 : 4;
+    for (nReg = 0; nReg < 4; nReg++)
+    {
+        TEXTLCD_mWriteReg(XPAR_TEXTLCD_0_S00_AXI_BASEADDR,
+                          TEXTLCD_S00_AXI_SLV_REG0_OFFSET + 4 * (base + nReg),
+                          RegVal[nReg]);
+    }
+}

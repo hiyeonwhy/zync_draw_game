@@ -1,0 +1,15 @@
+#-----------------------------------------------------------
+# Vivado v2019.1 (64-bit)
+# SW Build 2552052 on Fri May 24 14:49:42 MDT 2019
+# IP Build 2548770 on Fri May 24 18:01:18 MDT 2019
+# Start of session at: Tue Jun 24 19:57:16 2025
+# Process ID: 8176
+# Current directory: C:/work/teamp1
+# Command line: vivado.exe -gui_launcher_event rodinguilauncherevent14180 C:\work\teamp1\teamp1.xpr
+# Log file: C:/work/teamp1/vivado.log
+# Journal file: C:/work/teamp1\vivado.jou
+#-----------------------------------------------------------
+start_gui
+open_project C:/work/teamp1/teamp1.xpr
+update_compile_order -fileset sources_1
+launch_sdk -workspace C:/work/teamp1/teamp1.sdk -hwspec C:/work/teamp1/teamp1.sdk/system_wrapper.hdf
