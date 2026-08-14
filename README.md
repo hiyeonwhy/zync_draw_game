@@ -241,10 +241,3 @@ soc_project/
 └── README.md
 ```
 
----
-
-<div align="center">
-
-**SoC 프로젝트 12조**
-
-</div>
