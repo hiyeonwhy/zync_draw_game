@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -v \"axi_\\\\|S_AXI\\\\|//\")"
+    ]
+  }
+}
